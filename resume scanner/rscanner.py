@@ -9,21 +9,22 @@ from dotenv import load_dotenv
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
-import io
 
-# Load .env
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+
+# Load API Key
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Set Tesseract path (Windows)
+# Tesseract Path
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-def extract_text(file):
-    file_type = file.type
-    file_name = file.name.lower()
 
+# ---------------- TEXT EXTRACTION ----------------
+def extract_text(file):
     try:
-        if file_type == "application/pdf" or file_name.endswith(".pdf"):
+        if file.type == "application/pdf":
             try:
                 with pdfplumber.open(file) as pdf:
                     text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
@@ -31,127 +32,247 @@ def extract_text(file):
                         return text
             except:
                 pass
-            try:
-                images = convert_from_bytes(file.read())
-                return "\n".join(pytesseract.image_to_string(img) for img in images)
-            except:
-                return ""
 
-        elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            file_bytes = file.read()
+            images = convert_from_bytes(file_bytes)
+            return "\n".join(pytesseract.image_to_string(img) for img in images)
+
+        elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             return docx2txt.process(file)
 
-        elif file_type.startswith("image/"):
+        elif file.type.startswith("image/"):
             image = Image.open(file)
             return pytesseract.image_to_string(image)
 
-        else:
-            return ""
-
-    except Exception as e:
-        print("Text extraction error:", e)
+    except:
         return ""
 
+    return ""
+
+
+# ---------------- GEMINI ----------------
 def call_gemini(text, job_description):
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
     prompt = {
         "contents": [{
             "parts": [{
-                "text": (
-                    "You are a job eligibility evaluator.\n\n"
-                    "Given a resume and a job description, follow these steps:\n"
-                    "1. Extract name, email, phone, skills, experience, education, certifications (if any), projects, and summary from the resume.\n"
-                    "2. Analyze how well the candidate matches the job description.\n"
-                    "3. Return a JSON object with:\n"
-                    "- 'eligibility_score' (0 to 100),\n"
-                    "- 'reason' (why the score was assigned),\n"
-                    "- 'missing_criteria' (any key requirements not met),\n"
-                    "- 'matched_skills' (what they have that matches).\n\n"
-                    "Only output a valid JSON object like:\n"
-                    "{\n"
-                    "  \"eligibility_score\": 85,\n"
-                    "  \"reason\": \"Meets most technical skills and has 3 years relevant experience\",\n"
-                    "  \"missing_criteria\": [\"AWS certification\", \"Kubernetes\"],\n"
-                    "  \"matched_skills\": [\"Python\", \"Flask\", \"REST API\"]\n"
-                    "}\n\n"
-                    f"Job Description:\n{job_description}\n\n"
-                    f"Resume:\n{text}"
-                )
+                "text": f"""
+Return ONLY JSON:
+
+{{
+  "name": "Candidate Name",
+  "eligibility_score": number,
+  "skills_score": number,
+  "experience_score": number,
+  "education_score": number,
+  "reason": "short explanation",
+  "missing_criteria": ["..."],
+  "matched_skills": ["..."],
+  "skill_gap_analysis": "explain missing skills",
+  "suggestions": ["improvement tips"]
+}}
+
+Job Description:
+{job_description[:3000]}
+
+Resume:
+{text[:7000]}
+"""
             }]
         }]
     }
 
-    headers = {"Content-Type": "application/json"}
-
     try:
-        response = requests.post(url, headers=headers, json=prompt)
-        response.raise_for_status()
-        result_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        res = requests.post(url, headers={"Content-Type": "application/json"}, json=prompt)
+        res.raise_for_status()
+        data = res.json()
 
-        match = re.search(r'\{.*\}', result_text, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-            try:
-                return json.loads(json_str)
-            except:
-                return {"raw_output": result_text, "error": "JSON decoding failed"}
-        else:
-            return {"raw_output": result_text, "error": "No JSON object found"}
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+
+        return json.loads(match.group(0)) if match else None
 
     except Exception as e:
-        print("Gemini error:", e)
+        st.error(f"Error: {e}")
         return None
 
-# Streamlit App UI
-st.set_page_config(page_title="Resume Eligibility Scorer", layout="centered")
-st.title("🎯 Resume vs Job Eligibility Scorer")
 
-file = st.file_uploader("📄 Upload Resume (PDF, DOCX, or Image)", type=["pdf", "docx", "jpg", "jpeg", "png"])
-job_description = st.text_area("📝 Paste Job Description")
+# ---------------- PDF (RECRUITER) ----------------
+def generate_pdf(results):
+    path = "recruiter_report.pdf"
+    doc = SimpleDocTemplate(path)
+    styles = getSampleStyleSheet()
 
-if file and job_description.strip():
-    with st.spinner("🔍 Extracting text from resume..."):
-        resume_text = extract_text(file)
+    content = []
 
-    if resume_text.strip():
-        st.success("✅ Resume text extracted successfully.")
-        st.text_area("📄 Extracted Resume Text (first 1500 chars)", resume_text[:1500])
+    for r in results:
+        name = r.get("name", "Candidate")
 
-        with st.spinner("🤖 Analyzing eligibility with Gemini..."):
-            result = call_gemini(resume_text, job_description)
+        content.append(Paragraph(f"<b>{name}</b>", styles["Title"]))
+        content.append(Spacer(1, 10))
+
+        content.append(Paragraph(f"Score: {r.get('eligibility_score', 0)}%", styles["Normal"]))
+        content.append(Paragraph(f"Skills: {r.get('skills_score', 0)}", styles["Normal"]))
+        content.append(Paragraph(f"Experience: {r.get('experience_score', 0)}", styles["Normal"]))
+        content.append(Paragraph(f"Education: {r.get('education_score', 0)}", styles["Normal"]))
+
+        content.append(Spacer(1, 10))
+
+        content.append(Paragraph("<b>Strengths:</b>", styles["Normal"]))
+        for s in r.get("matched_skills", []):
+            content.append(Paragraph(f"- {s}", styles["Normal"]))
+
+        content.append(Spacer(1, 10))
+
+        content.append(Paragraph("<b>Weakness:</b>", styles["Normal"]))
+        for m in r.get("missing_criteria", []):
+            content.append(Paragraph(f"- {m}", styles["Normal"]))
+
+        content.append(Spacer(1, 20))
+
+    doc.build(content)
+    return path
+
+
+# ---------------- PDF (JOB SEEKER) ----------------
+def generate_single_pdf(result):
+    path = "job_seeker_report.pdf"
+    doc = SimpleDocTemplate(path)
+    styles = getSampleStyleSheet()
+
+    content = []
+
+    name = result.get("name", "Candidate")
+
+    content.append(Paragraph(f"<b>{name}</b>", styles["Title"]))
+    content.append(Spacer(1, 10))
+
+    content.append(Paragraph(f"Score: {result.get('eligibility_score', 0)}%", styles["Normal"]))
+    content.append(Paragraph(f"Skills: {result.get('skills_score', 0)}", styles["Normal"]))
+    content.append(Paragraph(f"Experience: {result.get('experience_score', 0)}", styles["Normal"]))
+    content.append(Paragraph(f"Education: {result.get('education_score', 0)}", styles["Normal"]))
+
+    content.append(Spacer(1, 10))
+
+    content.append(Paragraph("<b>Reason:</b>", styles["Normal"]))
+    content.append(Paragraph(result.get("reason", ""), styles["Normal"]))
+
+    content.append(Spacer(1, 10))
+
+    content.append(Paragraph("<b>Skill Gap:</b>", styles["Normal"]))
+    content.append(Paragraph(result.get("skill_gap_analysis", ""), styles["Normal"]))
+
+    content.append(Spacer(1, 10))
+
+    content.append(Paragraph("<b>Suggestions:</b>", styles["Normal"]))
+    for s in result.get("suggestions", []):
+        content.append(Paragraph(f"- {s}", styles["Normal"]))
+
+    doc.build(content)
+    return path
+
+
+# ---------------- UI ----------------
+st.set_page_config(page_title="AI Resume Analyzer", layout="centered")
+st.title("🎯 AI Resume Analyzer")
+
+if "mode" not in st.session_state:
+    st.session_state.mode = None
+
+if "resumes" not in st.session_state:
+    st.session_state.resumes = []
+
+if "upload_count" not in st.session_state:
+    st.session_state.upload_count = 1
+
+# Mode selection
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button("👤 Job Seeker"):
+        st.session_state.mode = "job"
+
+with col2:
+    if st.button("🧑‍💼 Recruiter"):
+        st.session_state.mode = "rec"
+
+# Back
+if st.session_state.mode:
+    if st.button("🔙 Back"):
+        st.session_state.mode = None
+        st.session_state.resumes = []
+        st.session_state.upload_count = 1
+
+
+# ---------------- JOB SEEKER ----------------
+if st.session_state.mode == "job":
+
+    file = st.file_uploader("Upload Resume", type=["pdf", "docx", "jpg", "png"])
+    jd = st.text_area("Job Description")
+
+    if file and jd:
+
+        text = extract_text(file)
+        result = call_gemini(text, jd)
 
         if result:
-            if "error" in result:
-                st.warning("⚠️ Gemini returned a non-JSON response.")
-                st.text_area("🔍 Raw Gemini Output", result["raw_output"])
-            else:
-                st.subheader("📌 Eligibility Report")
-                score = result.get("eligibility_score", 0)
+            st.metric("Score", f"{result.get('eligibility_score', 0)}%")
+            st.progress(result.get("eligibility_score", 0)/100)
 
-                # 🔁 Determine candidate level from score
-                if score >= 80:
-                    level = "Advanced"
-                elif score >= 50:
-                    level = "Intermediate"
-                else:
-                    level = "Beginner"
+            st.write("Skills:", result.get("skills_score"))
+            st.write("Experience:", result.get("experience_score"))
+            st.write("Education:", result.get("education_score"))
 
-                st.metric("Eligibility Score", f"{score}%")
-                st.metric("Candidate Level", level)
-                st.write("🧠 Reason:", result.get("reason", "Not provided"))
+            st.write("Reason:", result.get("reason"))
 
-                if "matched_skills" in result:
-                    st.write("✅ Matched Skills:")
-                    for skill in result["matched_skills"]:
-                        st.markdown(f"- {skill}")
+            st.write("📉 Skill Gap:", result.get("skill_gap_analysis"))
 
-                if "missing_criteria" in result:
-                    st.write("❌ Missing Criteria:")
-                    for miss in result["missing_criteria"]:
-                        st.markdown(f"- {miss}")
-        else:
-            st.error("❌ Gemini couldn't process the resume.")
-    else:
-        st.error("❌ No text could be extracted from the resume.")
-elif file and not job_description.strip():
-    st.warning("⚠️ Please paste the job description.")
+            st.write("💡 Suggestions")
+            for s in result.get("suggestions", []):
+                st.write("-", s)
+
+            pdf = generate_single_pdf(result)
+
+            with open(pdf, "rb") as f:
+                st.download_button("📄 Download Report", f, "My_Report.pdf")
+
+
+# ---------------- RECRUITER ----------------
+elif st.session_state.mode == "rec":
+
+    new_file = st.file_uploader("Upload Resume", type=["pdf", "docx"], key=f"upload_{st.session_state.upload_count}")
+
+    if new_file:
+        if new_file not in st.session_state.resumes:
+            st.session_state.resumes.append(new_file)
+
+   
+
+    if st.session_state.resumes:
+        for f in st.session_state.resumes:
+            st.write("•", f.name)
+
+    jd = st.text_area("Job Description")
+
+    if st.button("Analyze") and jd and st.session_state.resumes:
+
+        results = []
+
+        for f in st.session_state.resumes:
+            text = extract_text(f)
+            result = call_gemini(text, jd)
+            if result:
+                results.append(result)
+
+        results = sorted(results, key=lambda x: x.get("eligibility_score", 0), reverse=True)
+
+        for r in results:
+            st.write(r.get("name"))
+            st.write(r.get("eligibility_score"))
+
+        pdf = generate_pdf(results)
+
+        with open(pdf, "rb") as f:
+            st.download_button("📄 Download Report", f, "Recruiter_Report.pdf")
